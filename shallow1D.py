@@ -5,18 +5,26 @@ from matplotlib.animation import FuncAnimation
 import seaborn
 import sys
 
+#
+# This file implements a 1D shallow water equation in a rectangular canal of depth h0.
+#
+# simulation_step_naive() implements the shallow-water equations directly
+# simulation_step_controlvolume() uses the control-volume technique for greater numerical stability
+#
+# Try different initial condition set-ups using the square_dam_break(), smooth_dam_break(), and wave_paddle() functions
+
 # -------- SET UP SIMULATION PARAMETERS --------
-L = 1000                        # 1000m 
-n = 200                         # Number of simulation points
-g = 9.81                        # m/s^2
-h0 = 10                         # 10m water
-dx = L / n                      # dx = 1m
+Length = 1000                        # Length of canal in meters 
+n      = 200                         # Number of simulation points
+g      = 9.81                        # m/s^2
+h0     = 10                          # Initial water-depth in meters
+dx     = Length / n                  # dx in meters
 
 CFL_target = 0.2
 dt = CFL_target*dx/np.sqrt(g*(h0+2))   # Choose largest time step that satisfies the CFL-condition to CFL_target<1
 
 # -------- SET UP UNITS --------
-xs = np.linspace(0,L,n)
+xs = np.linspace(0,Length,n)
 plot_interval   = int(np.ceil( 0.5/dt))  # Update plot every 0.5 simulation second
 plot_resolution = int(np.ceil(  10/dx))  # Plot points at 1m intervals
 
@@ -33,19 +41,23 @@ h          = np.zeros(n,dtype=dtype)
 u_x        = np.zeros(n-2,dtype=dtype)
 eta_t      = np.zeros(n-2,dtype=dtype)
 
+# Middle, Left-shifted, and Right-shifted slices. This is short-hand to avoid sticking [1:-1],[0:-2], and [2:] everywhere.
+M = slice(1,-1)
+L = slice(0,-2)
+R = slice(2,None)
 
 # -------- VARIOUS INITIAL CONDITIONS --------
 #Square dam break
-def square_dam_break(dam_width,x0=L/2,height=1):
+def square_dam_break(dam_width,x0=Length/2,height=1):
     drop_start, drop_end = x0/dx-dam_width/(2*dx), x0/dx+dam_width/(2*dx)
     eta[int(round(drop_start)):int(round(drop_end))] = 1
 
 #Gaussian dam break
-def smooth_dam_break(width,x0=L/2,height=1):
-    xs = np.linspace(0,L,n)
+def smooth_dam_break(width,x0=Length/2,height=1):
+    xs = np.linspace(0,Length,n)
     eta[:] += height*np.exp(-(xs-x0)**2/(2*width**2))
 
-def wave_paddle(width,x0=L/2,t=0,period=100,amplitude=1):
+def wave_paddle(width,x0=Length/2,t=0,period=100,amplitude=1):
     paddle_start, paddle_end = x0/dx-width/(2*dx), x0/dx+width/(2*dx)
     eta[int(round(paddle_start)):int(round(paddle_end))] = amplitude*np.sin(t*2*np.pi/period)
 
@@ -53,22 +65,18 @@ def wave_paddle(width,x0=L/2,t=0,period=100,amplitude=1):
 
 # -------- THE ACTUAL SHALLOW WATER SIMULATION--------
 # Staggered grid first-order central finite difference
-def Dx0(f,dx): return (1/dx)*(f[2:]-f[1:-1])
-def Dx1(f,dx): return (1/dx)*(f[1:-1]-f[:-2])
+def Dx0(f,dx): return (1/dx)*(f[R]-f[M]) # d/dx on Grid 0
+def Dx1(f,dx): return (1/dx)*(f[M]-f[L]) # d/dx on Grid 1
 
-# We can write it in a single function, so that we can call it more neatly.
-def Dx(f,dx,grid=0):
-    n = len(f)
-    return (1/dx)*(f[2-grid:n-grid]-f[1-grid:-1-grid])
 
-# -- STRAIGHT FORWARD IMPLEMENTATION --
+# -- STRAIGHT-FORWARD IMPLEMENTATION --
 # u_t   = -g eta_x
 # eta_t = - d/dx (u*h) = -u*h_x -u_x*h
 def simulation_step_naive():
     # OMB Eq. (4.12)/(4.17):
     # u_t = -g eta_x
     eta_x    =  Dx0(eta,dx);
-    u[1:-1] += -g*eta_x*dt      # Forward-Euler time integration
+    u[M]    += -g*eta_x*dt      # Forward-Euler time integration
 
     # Velocity boundary-conditions
     u[:1]  =  0
@@ -78,46 +86,86 @@ def simulation_step_naive():
     h        = h0+eta
     h_x      = Dx0(h,dx)
     u_x      = Dx1(u,dx)
-    eta_t    = -u[1:-1]*h_x - u_x*h[1:-1];
+    eta_t    = -u[M]*h_x - u_x*h[M];
     
-    eta[1:-1]  += eta_t*dt      # Forward-Euler time integration
+    eta[M]  += eta_t*dt      # Forward-Euler time integration
 
     # Height boundary-conditions
     eta[0]  = eta[1]
     eta[-1] = eta[-2]
     
     # First order Shapiro filter, OMB Eq. (4.21)
-    eta[1:-1]  = (1-epsilon)*eta[1:-1] + epsilon*0.5 * (eta[2:] + eta[:-2])
- 
+    eta[M]  = (1-epsilon)*eta[M] + epsilon*(eta[R] + eta[L])/2
+
+    
+# -- CONTROL-VOLUME IMPLEMENTATION --    
+def controlvolume(u,h):
+    u_plus, u_minus = .5 * (u + np.abs(u)), .5 * (u - np.abs(u))
+    return u_plus[M]*h[M] + u_minus[M]*h[R] \
+         - u_plus[L]*h[L] - u_minus[R]*h[M]
+
+def simulation_step_controlvolume():
+    # OMB Eq. (4.12)/(4.17):
+    # Velocity: u_t = -g eta_x
+    eta_x = Dx(eta,dx,grid=0);
+    u[M] += -g*eta_x*dt      # Forward Euler time integration
+
+    # Velocity boundary-conditions
+    u[:1]  = 0
+    u[-2:] = 0
+
+    # OMB Eq. (4.13)/(4.19)
+    # Control-volume technique    
+    #
+    # Positive resp negative regions of u
+    u_plus, u_minus = .5 * (u + np.abs(u)), .5 * (u - np.abs(u))
+    # Eq. (4.19)
+    h[M]  = h0+eta[M]        
+    eta_star[M] = eta[M] -(dt/dx)*controlvolume(u,h)
+
+    # Displacement-height boundary condition 
+    eta_star[0]  = eta_star[1]
+    eta_star[-1] = eta_star[-2]
+     
+    # First-order Shapiro filter, OMB Eq. (4.21)
+    eta_smooth[M] = 0.5*(eta_star[L] + eta_star[R])
+    eta[M]        = (1-epsilon)*eta_star[M] +  epsilon*eta_smooth[M]
+
+    # Displacement-height boundary condition     
+    eta[0]  = eta_star[1]
+    eta[-1] = eta_star[-2]
+    
     
 # -------- PLOT FUNCTION --------
 def plot_update(frames):
     global t,t0
 
     for j in range(plot_interval):  # Run plot_interval simulation steps between each plot
+# Replace the next line by simulation_step_controlvolume() to use the control-volume technique
         simulation_step_naive()
 # Uncomment the next line to place a wave-generating paddle, waving for 100 seconds
-#        if(t<100): wave_paddle(40,period=43,amplitude=0.3,t=t,x0=L/2)
+#        if(t<100): wave_paddle(40,period=43,amplitude=0.3,t=t,x0=Length/2)
         t += dt
     
     if (t-t0>10): # Check water volume every 10 simulation seconds
         t0 = t
-        print(f"at {round(t,2)} seconds, water volume in eta is {round(dx*np.sum(eta[1:-1]),8)}")
+        print(f"at {round(t,2)} seconds, water volume in eta is {round(dx*np.sum(eta[M]),8)}")
 
+    # Update matplotlib-plot
     water_plot.set_ydata(eta[::plot_resolution])
     ax.set_title(f"time: {round(t)}s")
 
 
 
 # -------- INITIALIZE AND RUN THE SIMULATION + PLOTS --------    
-#square_dam_break(100,x0=L/2)
-smooth_dam_break(25,x0=200,height=1)
-smooth_dam_break(25,x0=500,height=1)
-smooth_dam_break(25,x0=700,height=1)
-smooth_dam_break(25,x0=900,height=1)
+#square_dam_break(100,x0=Length/2)
+smooth_dam_break(25,x0=1*Length/5,height=1)
+smooth_dam_break(25,x0=2*Length/5,height=1)
+smooth_dam_break(25,x0=3*Length/5,height=1)
+smooth_dam_break(25,x0=4*Length/5,height=1)
 
 
-#smooth_dam_break(25,x0=L/2,height=1)
+#smooth_dam_break(25,x0=Length/2,height=1)
 # CFL condition
 
 print(f"epsilon={epsilon}\n"
@@ -131,7 +179,7 @@ print(f"epsilon={epsilon}\n"
 
 t,t0 = 0,0     # Global time
 
-
+# Set up Matplotlib plot
 seaborn.set(style='ticks')
 fig, ax = plt.subplots()
 water_plot, = ax.plot(xs[::plot_resolution],eta[::plot_resolution], '-')
